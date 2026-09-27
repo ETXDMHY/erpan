@@ -13,8 +13,8 @@ android {
         applicationId = "com.huigu.phone10.mobile"
         minSdk = 26
         targetSdk = 36
-        versionCode = 12
-        versionName = "0.3.6"
+        versionCode = 54
+        versionName = "0.3.23-preview"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_1_8
@@ -35,6 +35,8 @@ dependencies {
     implementation(libs.okhttp)
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("com.github.gkonovalov.android-vad:silero:2.0.10")
+    implementation("io.coil-kt:coil:2.7.0")
+    implementation("io.coil-kt:coil-gif:2.7.0")
     testImplementation(libs.junit)
     testImplementation("com.squareup.okhttp3:mockwebserver:5.2.1")
 }
@@ -79,10 +81,12 @@ val generateErpanAbout by tasks.registering {
     val guide = file("使用说明.md")
     val notices = file("THIRD_PARTY_NOTICES.md")
     val license = rootProject.file("LICENSE")
-    inputs.files(guide, notices, license)
+    val dependencyLicenses = rootProject.file("licenses")
+    inputs.files(guide, notices, license, fileTree(dependencyLicenses))
     outputs.dir(aboutAssets)
     doLast {
         val output = aboutAssets.get().asFile.also { it.mkdirs() }
+        dependencyLicenses.copyRecursively(output.resolve("licenses"), overwrite = true)
         output.resolve("erpan-guide.md").writeText(guide.readText())
         output.resolve("erpan-notices.txt").writeText(notices.readText() + "\n\n" + license.readText())
     }

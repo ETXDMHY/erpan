@@ -68,9 +68,56 @@ class OperitBridge(context: Context) : AutoCloseable {
         require(chatId.isNotBlank() && chatId.length <= 160 && text.isNotBlank() && text.length <= 60_000) {
             "OPERIT_INVALID_REQUEST"
         }
-        execute(OperitPending("reply", chatId, text), 130_000L) { event ->
+        // Match the supported O plugin window, plus its existing 10s IPC margin.
+        // List/observe operations keep their short timeouts; manual stop is immediate.
+        execute(OperitPending("reply", chatId, text), 30 * 60_000L + 10_000L) { event ->
             if (event["type"].asString == "chunk") onChunk(event["text"].asString)
         }
+    }
+
+    internal suspend fun readReplies(chatId: String, after: Long?): ReplySnapshot {
+        require(chatId.isNotBlank() && chatId.length <= 160)
+        val replies = mutableListOf<ObservedReply>()
+        var timestamp: Long? = null
+        var finished = true
+        var text = StringBuilder()
+        var snapshot: ReplySnapshot? = null
+        var chars = 0
+        execute(OperitPending("observe_stream", chatId, after = after, paged = true), 20_000) { event ->
+            check(snapshot == null) { "OPERIT_INVALID_EVENT" }
+            when (event["type"].asString) {
+                "message_start" -> {
+                    check(timestamp == null && replies.isEmpty()) { "OPERIT_INVALID_EVENT" }
+                    timestamp = event["timestamp"].asLong.also {
+                        check(after != null && it > after && it > (replies.lastOrNull()?.timestamp ?: -1))
+                    }
+                    finished = event["finished"]?.asBoolean ?: error("OPERIT_INVALID_EVENT")
+                    text = StringBuilder()
+                }
+                "chunk" -> {
+                    check(timestamp != null)
+                    val delta = event["text"].asString
+                    chars += delta.length; check(chars <= ReplyListener.MAX_MESSAGE_CHARS) { "OPERIT_INVALID_EVENT" }
+                    text.append(delta)
+                }
+                "message_end" -> {
+                    replies += ObservedReply(requireNotNull(timestamp), text.toString(), finished)
+                    timestamp = null
+                }
+                "snapshot" -> {
+                    check(timestamp == null)
+                    val cursor = event["cursor"].asLong
+                    check(event["paged"]?.asBoolean == true) { "OPERIT_PLUGIN_UPDATE_REQUIRED" }
+                    check(event["streaming"]?.asBoolean == true && cursor >= (after ?: 0))
+                    check(replies.filter { it.finished }.all { it.timestamp <= cursor })
+                    val notice = event["notice"]?.asString
+                    check(notice == null || notice in setOf("HISTORY_GAP", "MESSAGE_TOO_LARGE")) { "OPERIT_INVALID_EVENT" }
+                    snapshot = ReplySnapshot(cursor, replies.toList(), event["processing"].asBoolean, event["failed"].asBoolean, notice)
+                }
+                else -> error("OPERIT_INVALID_EVENT")
+            }
+        }
+        return snapshot ?: error("OPERIT_OBSERVE_UNAVAILABLE")
     }
 
     private suspend fun execute(pending: OperitPending, timeout: Long, consume: suspend (JsonObject) -> Unit) {
@@ -156,7 +203,7 @@ class OperitBridge(context: Context) : AutoCloseable {
             "OPERIT_EVENT_OVERFLOW", "OPERIT_UNAVAILABLE", "OPERIT_TIMEOUT", "OPERIT_STREAMING_UNAVAILABLE", "REQUEST_ALREADY_CLAIMED",
             "OPERIT_BUSY", "JOURNAL_FAILED", "JOURNAL_FULL", "INVALID_OPERIT_RESPONSE", "RESPONSE_TOO_LARGE",
             "OPERIT_REPLY_FAILED", "OPERIT_LIST_FAILED", "OPERIT_CANCEL_FAILED", "INVALID_REQUEST",
-            "OPERIT_WORKER_FAILED", "OPERIT_WORKER_UNAVAILABLE")
-        private fun safeCode(value: String?) = value?.takeIf { it in codes } ?: "OPERIT_UNAVAILABLE"
+            "OPERIT_WORKER_FAILED", "OPERIT_WORKER_UNAVAILABLE", "OPERIT_OBSERVE_UNAVAILABLE", "OPERIT_OBSERVE_FAILED", "OPERIT_PLUGIN_UPDATE_REQUIRED")
+        internal fun safeCode(value: String?) = value?.takeIf { it in codes } ?: "OPERIT_UNAVAILABLE"
     }
 }

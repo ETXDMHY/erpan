@@ -9,6 +9,44 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class OperitInboxTest {
+    @Test fun workerDispatchIsOneTimeAndDoesNotConsumeTheReplySequence() = runBlocking {
+        val pending = OperitPending("reply", "chat", "hello")
+        val claim = event(pending, -1).apply { addProperty("type", "worker_claim"); remove("seq") }
+        assertTrue(pending.accept(claim))
+        assertFalse(pending.accept(claim))
+        assertNull(pending.failure)
+        assertTrue(pending.events.tryReceive().isFailure)
+        assertTrue(pending.accept(event(pending, 0).apply { addProperty("type", "accepted") }))
+        assertFalse(pending.accept(claim))
+        assertTrue(pending.accept(event(pending, 1)))
+        assertEquals("accepted", pending.events.receive()["type"].asString)
+        assertEquals("chunk", pending.events.receive()["type"].asString)
+    }
+
+    @Test fun cancelledRequestCannotStartAWorker() {
+        val pending = OperitPending("reply", "chat", "hello")
+        pending.cancel()
+        assertFalse(pending.accept(event(pending, -1).apply { addProperty("type", "worker_claim") }))
+        assertNull(pending.failure)
+    }
+
+    @Test fun maximumPagedSnapshotFitsNativeQueueBeforeAnyConsumerRuns() = runBlocking {
+        val pending=OperitPending("observe_stream","chat",after=10,paged=true)
+        assertTrue(String(pending.payload()).contains("\"paged\":true"))
+        var seq=0
+        fun frame(type:String,text:String?=null)=event(pending,seq++).apply {
+            addProperty("type",type);if(text!=null)addProperty("text",text)
+        }
+        assertTrue(pending.accept(frame("message_start")))
+        val text="字".repeat(ReplyListener.MAX_MESSAGE_CHARS)
+        for(chunk in text.chunked(8192))assertTrue(pending.accept(frame("chunk",chunk)))
+        assertTrue(pending.accept(frame("message_end")))
+        assertTrue(pending.accept(frame("snapshot")))
+        assertTrue(pending.accept(frame("complete")))
+        val received=StringBuilder()
+        for(e in pending.events)if(e["type"].asString=="chunk")received.append(e["text"].asString)
+        assertEquals(text,received.toString());assertNull(pending.failure)
+    }
     @Test fun detachedWorkerFailureIsVisibleAfterPartialOutputWithoutGuessingSequence() = runBlocking {
         val pending = OperitPending("reply", "chat", "hello")
         assertTrue(pending.accept(event(pending, 0)))

@@ -6,10 +6,12 @@ import test from 'node:test';
 const source = new URL(process.env.MOBILE_OPERIT_SOURCE || '../operit/phone10-mobile-voice.js', import.meta.url);
 const hasWorker = fs.readFileSync(source, 'utf8').includes('function loadWorker(');
 
-test('worker bootstrap copies assets with CopyOption interface compatible arguments', { skip: !hasWorker }, () => {
+test('worker bootstrap avoids Path conversion recursion in the real O Java bridge', { skip: !hasWorker }, () => {
   const files = new Set(), calls = [], hash = 'a'.repeat(64);
-  const file = path => ({ exists: () => files.has(path), toPath: () => path,
-    getAbsolutePath: () => path, setReadOnly() { calls.push('readonly'); return true; } });
+  const file = path => ({ exists: () => files.has(path), toPath() { throw Error('Path serialization stack overflow'); },
+    getAbsolutePath: () => path, setReadOnly() { calls.push('readonly'); return true; },
+    renameTo(target) { assert.ok(files.has(path)); assert.ok(calls.includes('readonly'));
+      files.delete(path);files.add(target.getAbsolutePath());calls.push('move');return true; } });
   const worker = {};
   const sandbox = { exports:{}, Java:{ loadJar(path) { assert.ok(files.has(path)); calls.push('load'); }, type(name) {
     if (name === 'java.util.Scanner') return {newInstance: () => ({next: () => hash, close(){}})};
@@ -18,27 +20,18 @@ test('worker bootstrap copies assets with CopyOption interface compatible argume
       newInstance: (dir, name) => file(dir + '/' + name),
       createTempFile() { files.add('/worker/precreated.tmp'); return file('/worker/precreated.tmp'); }
     };
-    if (name === 'java.nio.file.Files') return {
-      copy(input, target, options) {
-        // O serializes enum results as strings. CopyOption is an interface, so
-        // its converter cannot infer StandardCopyOption from REPLACE_EXISTING.
-        assert.equal(options.length, 0, 'CopyOption interface cannot accept string enum values');
-        assert.ok(!files.has(target), 'copy without replacement needs an absent target');
-        files.add(target); calls.push('copy');
-      },
-      move(from, to, options) {
-        assert.equal(options.length, 0); assert.ok(files.has(from));
-        assert.ok(calls.includes('readonly')); files.delete(from); files.add(to); calls.push('move');
-      }
-    };
+    if (name === 'java.nio.file.Files') return {};
+    if (name === 'java.io.FileOutputStream') return {newInstance: target=>({
+      write(){files.add(target.getAbsolutePath());calls.push('copy');},close(){}
+    })};
     if (name.endsWith('.OperitRequestWorker')) return {newInstance: () => worker};
     throw Error('unexpected native type ' + name);
   }}};
   vm.runInNewContext(fs.readFileSync(source, 'utf8'), sandbox);
-  const context = {createPackageContext: () => ({getAssets: () => ({open: () => ({close(){}})})}), getDir: () => '/worker'};
+  const context = {createPackageContext: () => ({getAssets: () => ({open: () => ({transferTo(out){out.write();},close(){}})})}), getDir: () => '/worker'};
   assert.equal(sandbox.loadWorker(context), worker);
   assert.equal(sandbox.loadWorker(context), worker);
-  assert.deepEqual(calls, ['copy','readonly','move','load','load']);
+  assert.deepEqual(calls, ['readonly','copy','move','load','load']);
   sandbox.Java.loadJar = () => { throw Error('private raw diagnostic'); };
   assert.throws(() => sandbox.loadWorker(context), /^Error: WORKER_LOAD$/);
 });
@@ -249,7 +242,7 @@ test('cancel racing O asynchronous preflight is retried only after own start eve
   assert.equal(f.events.filter(e => e.type === 'complete').length,0);
 });
 
-test('broadcast returns before a slow short reply and detached work still delivers exactly once', { skip: !hasWorker }, async () => {
+test('broadcast returns before a slow short reply and detached work still delivers exactly once', async () => {
   const f = fixture(); const queued = []; const completions = [];
   let releaseModel;
   const model = new Promise(resolve => { releaseModel = resolve; });
@@ -277,7 +270,7 @@ test('broadcast returns before a slow short reply and detached work still delive
     : nativeType(name);
   const trigger = { uri:'content://com.huigu.phone10.mobile.operit/request/' + request.id };
   let returned = false;
-  const receipt = sandbox.exports.receive({ event:JSON.stringify(trigger) }).then(() => { returned = true; });
+  const receipt = Promise.resolve(sandbox.exports.receive({ event:JSON.stringify(trigger) })).then(() => { returned = true; });
   try {
     await new Promise(setImmediate);
     assert.equal(returned, true, 'broadcast must finish while the model is still pending');
@@ -290,4 +283,59 @@ test('broadcast returns before a slow short reply and detached work still delive
     assert.equal(f.events.filter(e => e.type === 'chunk').map(e => e.text).join(''), '好。');
     assert.equal(f.events.at(-1).type, 'complete');
   } finally { releaseModel(); await receipt; }
+});
+
+function receiverFixture() {
+  const f = fixture(); let payload = request, starts = 0, dispatchClaimed = false;
+  const sandbox = {exports:{}, complete(){}, Java:{getApplicationContext:()=>({}),
+    type:()=>({parse:()=>({getLastPathSegment:()=>payload.id})})}};
+  vm.runInNewContext(fs.readFileSync(source,'utf8'),sandbox);
+  sandbox.readRequest=()=>payload;
+  sandbox.host=()=>f.env;
+  sandbox.startWorker=()=>{starts++;};
+  f.env.emit=event=>{
+    if(event.type==='worker_claim') {
+      if(dispatchClaimed)return false;
+      dispatchClaimed=true;return true;
+    }
+    f.events.push(event);return true;
+  };
+  const params={event:JSON.stringify({uri:'content://com.huigu.phone10.mobile.operit/request/'+request.id})};
+  return {...f,sandbox,params,starts:()=>starts,setPayload:value=>{payload=value;}};
+}
+
+test('duplicate receiver dispatches only one worker and cannot fail the active reply',async()=>{
+  const f=receiverFixture();
+  assert.equal((await f.sandbox.exports.receive(f.params)).status,'DISPATCHED');
+  f.sandbox.startWorker=()=>{throw Error('duplicate saturated worker');};
+  await f.sandbox.exports.receive(f.params);
+  assert.equal(f.starts(),1);assert.equal(f.events.length,0);
+});
+
+test('worker bootstrap failure emits authenticated terminal failure without sending chat',async()=>{
+  const f=receiverFixture();f.sandbox.startWorker=()=>{throw Error('private detail');};
+  assert.equal((await f.sandbox.exports.receive(f.params)).status,'DISPATCH_FAILED');
+  assert.equal(f.calls.length,0);assert.equal(f.events.length,1);
+  assert.equal(f.events[0].type,'worker_error');assert.equal(f.events[0].nonce,request.nonce);
+  assert.equal(JSON.stringify(f.events).includes('private detail'),false);
+});
+
+test('cancel still runs directly while a reply worker owns the dispatch',async()=>{
+  const f=receiverFixture();await f.sandbox.exports.receive(f.params);
+  f.setPayload({...request,kind:'cancel',targetId:request.id});
+  assert.equal((await f.sandbox.exports.receive(f.params)).status,'HANDLED');
+  assert.equal(f.starts(),1);assert.deepEqual(f.calls,[['cancel',request.id]]);
+});
+
+test('native worker receives official JsToolManager rather than the package registry',()=>{
+  const context={},handler={},packages={},manager={};let supplied;
+  const sandbox={exports:{},Java:{type(name){return {getStatic:()=>({getInstance(...args){
+    if(name.endsWith('.AIToolHandler')){assert.equal(args[0],context);return handler;}
+    if(name.endsWith('.PackageManager')){assert.equal(args[1],handler);return packages;}
+    assert.ok(name.endsWith('.JsToolManager'));assert.equal(args[1],packages);return manager;
+  }})};}}};
+  vm.runInNewContext(fs.readFileSync(source,'utf8'),sandbox);
+  sandbox.loadWorker=()=>({start:(...args)=>{supplied=args;}});
+  sandbox.startWorker(context,{uri:'private-uri'},request);
+  assert.deepEqual(supplied,[context,manager,'private-uri',request.id,request.nonce]);
 });

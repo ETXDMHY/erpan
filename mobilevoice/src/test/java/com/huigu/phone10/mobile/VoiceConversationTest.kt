@@ -6,6 +6,39 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class VoiceConversationTest {
+    @Test fun wholeReplyReportsWritingThenSynthesisForListenAndCallWithoutExtraConsumer() = runBlocking {
+        for (listen in listOf(false, true)) {
+            val states = mutableListOf<String>()
+            var consumers = 0
+            var body = ""
+            val flow = VoiceConversation(this, { "测试" }, { _, chunk -> chunk("第一句。"); chunk("第二句。") },
+                { fail("must use single stream") }, {}, { states.add(it) }, streamSpeak = { input ->
+                    consumers++
+                    for (part in input) body += part
+                    assertTrue(states.contains("回复已写完 · 正在生成整段语音…"))
+                }, wholeReplyTts = true)
+            val job = if (listen) flow.playReply("第一句。第二句。") else flow.submit(byteArrayOf(1))
+            withTimeout(3000) { job.join() }
+            assertEquals(1, consumers)
+            assertEquals("第一句。第二句。", body)
+            assertTrue(states.contains("整段模式 · 等待回复写完…"))
+            assertTrue(states.indexOf("整段模式 · 等待回复写完…") < states.indexOf("回复已写完 · 正在生成整段语音…"))
+        }
+    }
+    @Test fun sentenceProviderReceivesCombinedPhrasesBeforeReplyFinishes() = runBlocking {
+        val spoken = mutableListOf<String>()
+        val heard = CompletableDeferred<Unit>()
+        val conversation = VoiceConversation(this, { "你好" }, { _, chunk ->
+            chunk("嗯，"); delay(200); chunk("我们今天一起玩游戏吧。");
+            withTimeout(2000) { heard.await() }
+            chunk("好")
+        }, { fail("must use continuous playback queue") }, {}, {}, streamSpeak = { input ->
+            for (part in input) { spoken.add(part); heard.complete(Unit) }
+        }, sentenceTts = true)
+        withTimeout(3000) { conversation.submit(byteArrayOf(1)).join() }
+        assertEquals(listOf("嗯，我们今天一起玩游戏吧。", "好"), spoken)
+    }
+
     @Test fun disabledVoiceInterruptionIgnoresSpeechDuringThinkingAndPlaybackThenResumes() = runBlocking {
         val thinking = CompletableDeferred<Unit>()
         val finishThinking = CompletableDeferred<Unit>()

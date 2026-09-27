@@ -6,8 +6,10 @@ import android.media.AudioTrack
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.sqrt
 
 internal interface PcmSink {
+    fun configure(sampleRate: Int) { require(sampleRate == 24_000) }
     fun write(data: ByteArray, offset: Int, length: Int): Int
     fun playedFrames(): Long
     fun endPaddingBytes(): Int = 0
@@ -16,14 +18,53 @@ internal interface PcmSink {
 }
 
 class PcmPlayer internal constructor(private val sink: PcmSink, private val beforeWrite: () -> Unit = {}) {
-    constructor(beforeWrite: () -> Unit = {}): this(AudioTrackSink(), beforeWrite)
+    constructor(mediaPlayback: Boolean = false, beforeWrite: () -> Unit = {}): this(AudioTrackSink(mediaPlayback), beforeWrite)
     private val closed = AtomicBoolean(false)
     private val paused = AtomicBoolean(false)
     @Volatile private var pauseStarted = 0L
     private val writerLock = Any()
     private var carry: Byte? = null
     @Volatile private var submittedBytes = 0L
-    private var drainTarget: Long? = null
+    @Volatile private var drainTarget: Long? = null
+    private val captionLock = Any()
+    private val captionMarks = ArrayDeque<Pair<Long, Int>>()
+    private var captionIndex = 0
+    // Called by the ordered consumer, never by speculative synthesis.
+    fun markCaptionSegment(text: String) = synchronized(writerLock) {
+        checkOpen()
+        check(carry == null && submittedBytes % 2 == 0L) { "PCM 段落不完整。" }
+        synchronized(captionLock) { captionMarks.addLast(submittedBytes / 2 to captionIndex++) }
+    }
+    fun playbackCaption(): Int? {
+        if (closed.get()) return null
+        val head = minOf(sink.playedFrames(), drainTarget ?: (submittedBytes / 2))
+        if (head <= 0 || closed.get()) return null
+        return synchronized(captionLock) {
+            while (captionMarks.size > 1 && captionMarks.elementAt(1).first < head)
+                captionMarks.removeFirst()
+            captionMarks.firstOrNull()?.takeIf { it.first < head }?.second
+        }
+    }
+    private val levelLock = Any()
+    private val levelWindows = ArrayDeque<LevelWindow>()
+    private var partialLevel: LevelWindow? = null
+    private var levelSampleRate = 24_000
+    private var levelByteCarry: Byte? = null
+    private var recordedFrames = 0L
+    private var binPower = 0.0
+    private var binSamples = 0
+    private data class LevelWindow(val startFrame: Long, val endFrame: Long, val level: Float)
+    internal val bufferedLevelWindowCount: Int get() = synchronized(levelLock) {
+        levelWindows.size + if (partialLevel == null) 0 else 1
+    }
+
+    fun configure(sampleRate: Int) = synchronized(writerLock) {
+        checkOpen()
+        require(sampleRate in 8000..48000) { "不支持的音频采样率。" }
+        check(submittedBytes == 0L && carry == null && drainTarget == null) { "音频开始后不能切换格式。" }
+        sink.configure(sampleRate)
+        levelSampleRate = sampleRate
+    }
 
     fun write(bytes: ByteArray) = synchronized(writerLock) {
         checkOpen()
@@ -49,10 +90,67 @@ class PcmPlayer internal constructor(private val sink: PcmSink, private val befo
                 check(System.nanoTime() - lastProgress < 5_000_000_000L) { "音频播放停滞。" }
                 Thread.sleep(5)
             } else {
+                recordAcceptedPcm(data, offset, count)
                 offset += count
                 submittedBytes += count
                 lastProgress = System.nanoTime()
             }
+        }
+    }
+
+    private fun recordAcceptedPcm(data: ByteArray, offset: Int, count: Int) {
+        val completed = ArrayList<LevelWindow>()
+        val binFrames = maxOf(1, levelSampleRate / 50) // 20 ms, independent of sink write size.
+        fun accept(low: Byte, high: Byte) {
+            val sample = ((high.toInt() shl 8) or (low.toInt() and 255)).toShort().toInt()
+            binPower += sample.toDouble() * sample
+            binSamples++
+            recordedFrames++
+            if (binSamples == binFrames) {
+                completed.add(LevelWindow(recordedFrames - binSamples, recordedFrames,
+                    normalizedLevel(binPower, binSamples)))
+                binPower = 0.0
+                binSamples = 0
+            }
+        }
+        var index = offset
+        val end = offset + count
+        levelByteCarry?.let { low ->
+            if (index < end) {
+                accept(low, data[index])
+                levelByteCarry = null
+                index++
+            }
+        }
+        while (index + 1 < end) {
+            accept(data[index], data[index + 1])
+            index += 2
+        }
+        if (index < end) levelByteCarry = data[index]
+        val partial = if (binSamples > 0) LevelWindow(recordedFrames - binSamples, recordedFrames,
+            normalizedLevel(binPower, binSamples)) else null
+        synchronized(levelLock) {
+            completed.forEach { levelWindows.addLast(it) }
+            partialLevel = partial
+            while (levelWindows.size + (if (partialLevel == null) 0 else 1) > 1_000)
+                levelWindows.removeFirst()
+        }
+    }
+
+    private fun normalizedLevel(power: Double, count: Int): Float =
+        (sqrt(power / count) / 32768.0 * 6.0).toFloat().coerceIn(0f, 1f)
+
+    /** Read the volume at AudioTrack's playback head, without waiting for a stalled writer. */
+    fun playbackLevel(): Float {
+        if (closed.get() || paused.get()) return 0f
+        val frame = sink.playedFrames()
+        if (frame <= 0 || closed.get() || paused.get()) return 0f
+        return synchronized(levelLock) {
+            while (levelWindows.isNotEmpty() && levelWindows.first().endFrame <= frame)
+                levelWindows.removeFirst()
+            val window = levelWindows.firstOrNull()?.takeIf { frame >= it.startFrame && frame < it.endFrame }
+                ?: partialLevel?.takeIf { frame >= it.startFrame && frame < it.endFrame }
+            window?.level ?: 0f
         }
     }
 
@@ -99,23 +197,47 @@ class PcmPlayer internal constructor(private val sink: PcmSink, private val befo
     private fun checkOpen() { if (closed.get()) throw CancellationException("播放已停止") }
 }
 
-private class AudioTrackSink : PcmSink {
+private class AudioTrackSink(private val mediaPlayback: Boolean) : PcmSink {
     private val lock = Any()
     private var closed = false
     private var wraps = 0L
     private var lastHead = 0L
-    private val track = AudioTrack.Builder()
-        .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+    private var sampleRate = 24_000
+    private var paused = false
+    private var track = createTrack(sampleRate)
+
+    private fun createTrack(rate: Int) = AudioTrack.Builder()
+        .setAudioAttributes(AudioAttributes.Builder().setUsage(if (mediaPlayback)
+            AudioAttributes.USAGE_MEDIA else AudioAttributes.USAGE_VOICE_COMMUNICATION)
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
-        .setAudioFormat(AudioFormat.Builder().setSampleRate(24_000)
+        .setAudioFormat(AudioFormat.Builder().setSampleRate(rate)
             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
         .setTransferMode(AudioTrack.MODE_STREAM)
-        .setBufferSizeInBytes(maxOf(4800, AudioTrack.getMinBufferSize(24_000,
+        .setBufferSizeInBytes(maxOf(rate / 5, AudioTrack.getMinBufferSize(rate,
             AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)))
         .build().also {
             if (it.state != AudioTrack.STATE_INITIALIZED) { it.release(); error("无法初始化音频播放。") }
-            try { it.play() } catch (error: Exception) { it.release(); throw error }
+            try {
+                it.addOnRoutingChangedListener({ routed ->
+                    VoiceDiagnostics.record("playback_route_type_${routed.routedDevice?.type ?: 0}")
+                }, android.os.Handler(android.os.Looper.getMainLooper()))
+                it.play()
+            } catch (error: Exception) { it.release(); throw error }
         }
+
+    override fun configure(sampleRate: Int) = synchronized(lock) {
+        if (closed) throw CancellationException("播放已停止")
+        if (sampleRate != this.sampleRate) {
+            val replacement = createTrack(sampleRate)
+            try { if (paused) replacement.pause() }
+            catch (error: Exception) { replacement.release(); throw error }
+            track.release()
+            track = replacement
+            this.sampleRate = sampleRate
+            wraps = 0L
+            lastHead = 0L
+        }
+    }
 
     override fun write(data: ByteArray, offset: Int, length: Int): Int = synchronized(lock) {
         if (closed) 0 else track.write(data, offset, length, AudioTrack.WRITE_NON_BLOCKING)
@@ -132,6 +254,7 @@ private class AudioTrackSink : PcmSink {
     override fun endPaddingBytes(): Int = synchronized(lock) { if (closed) 0 else track.bufferSizeInFrames * 2 }
 
     override fun setPaused(paused: Boolean) = synchronized(lock) {
+        this.paused = paused
         if (!closed) { if (paused) track.pause() else track.play() }
     }
 

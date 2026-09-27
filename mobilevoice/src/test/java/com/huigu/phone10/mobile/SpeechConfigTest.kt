@@ -5,6 +5,14 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SpeechConfigTest {
+    @Test fun missingConfigurationNamesEachFieldWithoutShowingItsValue() {
+        val invalid = configuredBailian().copy(sttKey = "", ttsKey = "", voice = "")
+        val error = assertThrows(IllegalArgumentException::class.java) { invalid.validate() }
+        assertTrue(error.message.orEmpty().contains("识别 API Key"))
+        assertTrue(error.message.orEmpty().contains("合成 API Key"))
+        assertTrue(error.message.orEmpty().contains("音色 ID"))
+    }
+
     private fun configuredBailian() = SpeechConfig.bailianDefaults().copy(
         sttKey = "test-asr-key", ttsKey = "test-tts-key", voice = "test-voice")
 

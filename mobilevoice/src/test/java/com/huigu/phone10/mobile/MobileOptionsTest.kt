@@ -13,6 +13,7 @@ class MobileOptionsTest {
         assertFalse(settings.overlayEnabled)
         assertFalse(settings.smartEndpoint)
         assertFalse(settings.disableVoiceInterruption)
+        assertFalse(settings.gameAudioCoexist)
         assertEquals("old", settings.chatId)
     }
 
@@ -20,6 +21,15 @@ class MobileOptionsTest {
         val gson = Gson()
         val settings = MobileSettings(SpeechConfig.bailianDefaults(), disableVoiceInterruption = true)
         val loaded = gson.fromJson(gson.toJson(settings), MobileSettings::class.java)
+        assertTrue(loaded.disableVoiceInterruption)
+    }
+
+    @Test fun gameAudioPreferenceSurvivesSettingsRoundTripWithoutChangingInterruption() {
+        val gson = Gson()
+        val settings = MobileSettings(SpeechConfig.bailianDefaults(), gameAudioCoexist = true,
+            disableVoiceInterruption = true)
+        val loaded = gson.fromJson(gson.toJson(settings), MobileSettings::class.java)
+        assertTrue(loaded.gameAudioCoexist)
         assertTrue(loaded.disableVoiceInterruption)
     }
 

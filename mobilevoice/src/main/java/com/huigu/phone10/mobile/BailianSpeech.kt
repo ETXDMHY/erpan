@@ -208,7 +208,7 @@ internal class BailianSpeech(
                             if (asr) {
                                 if (pending.isNotEmpty()) throw SpeechApiException("百炼识别结果不完整，请重新说一句。")
                                 val result = SpeechTranscript.combine(sentences.values)
-                                if (result.text.isEmpty()) throw SpeechApiException("没有识别到文字，请重新说一句。")
+                                if (result.text.isEmpty()) throw NoSpeechRecognized()
                                 return@coroutineScope result
                             }
                             check(inputFinished.get()) { "TTS finished before input ended" }

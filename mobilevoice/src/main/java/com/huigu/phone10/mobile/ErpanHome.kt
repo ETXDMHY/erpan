@@ -1,6 +1,6 @@
 package com.huigu.phone10.mobile
 
-import android.graphics.Bitmap
+import android.graphics.drawable.Drawable
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -12,21 +12,26 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 
-@Composable internal fun ErpanHome(settings: MobileSettings, state: VoiceState, avatar: Bitmap?,
+@Composable internal fun ErpanHome(settings: MobileSettings, state: VoiceState, avatar: Drawable?,
+    appearance: AvatarAppearance,
     busy: Boolean, notice: String, onStart: () -> Unit, onEnd: () -> Unit, onMic: () -> Unit,
-    onOverlay: (Boolean) -> Unit, onSmart: (Boolean) -> Unit, onVoiceInterruption: (Boolean) -> Unit, onAvatar: () -> Unit,
-    onConfig: () -> Unit, onVoice: () -> Unit, onLogs: () -> Unit, onAbout: () -> Unit) {
+    onOverlay: (Boolean) -> Unit, onSmart: (Boolean) -> Unit, onConfirmBeforeSend: (Boolean) -> Unit,
+    onVoiceInterruption: (Boolean) -> Unit, onReviewDraft: () -> Unit,
+    onAvatar: () -> Unit,
+    onConfig: () -> Unit, onLogs: () -> Unit, onAbout: () -> Unit,
+    onProfiles: () -> Unit, onCaptions: (Boolean) -> Unit,
+    onListenOnly: (Boolean) -> Unit, onInterrupt: () -> Unit) {
     var showTitle by remember { mutableStateOf(false) }
     var expanded by remember { mutableStateOf(false) }
-    val configured = settings.chatId.isNotBlank() && runCatching { settings.speech.validate() }.isSuccess
+    val configured = configurationIssues(settings).isEmpty()
     Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().verticalScroll(rememberScrollState())
         .padding(horizontal = 20.dp).padding(top = 17.dp, bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.SpaceBetween) {
@@ -42,13 +47,19 @@ import androidx.compose.ui.unit.sp
             Box(Modifier.weight(0.37f).aspectRatio(1f).border(0.7.dp, ErpanColors.Line, CircleShape).padding(10.dp)
                 .border(0.7.dp, ErpanColors.Line, CircleShape).padding(4.dp).clip(CircleShape)
                 .background(ErpanColors.Blush).clickable(enabled = !state.running, onClick = onAvatar), contentAlignment = Alignment.Center) {
-                if (avatar != null) Image(avatar.asImageBitmap(), contentDescription = "当前头像", contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize())
-                else Image(painterResource(R.drawable.ic_mobile_voice), contentDescription = "耳畔默认头像",
-                    modifier = Modifier.fillMaxSize())
+                AndroidView(factory = { context ->
+                    Phone10MicView(context).apply {
+                        render(Phone10MicrophoneState(enabled = true))
+                        isClickable = false
+                    }
+                }, modifier = Modifier.fillMaxSize(), update = { view ->
+                    view.previewScale = minOf(2f, 90f / appearance.windowDp)
+                    view.appearance = appearance
+                    if (view.avatar !== avatar) view.avatar = avatar
+                })
                 Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().background(Color.Black.copy(alpha = 0.45f)).padding(vertical = 6.dp),
                     contentAlignment = Alignment.Center) {
-                    Text("更换头像", color = Color.White, fontSize = 11.sp)
+                    Text("头像与光效", color = Color.White, fontSize = 11.sp)
                 }
             }
             Surface(Modifier.weight(0.63f), color = ErpanColors.Paper, shape = RoundedCornerShape(15.dp),
@@ -67,19 +78,45 @@ import androidx.compose.ui.unit.sp
                 }
             }
         }
+        Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                FilterChip(selected = !settings.listenOnly, onClick = { onListenOnly(false) }, enabled = !state.running && !busy,
+                    label = { Text("语音通话") })
+                FilterChip(selected = settings.listenOnly, onClick = { onListenOnly(true) }, enabled = !state.running && !busy,
+                    label = { Text("只听回复") })
+            }
+            Text(if (settings.speech.clientSegmentedTts) "首个断句标点到达即提交合成，后续合段；实际出声仍需等待模型生成。"
+            else if (settings.speech.wholeReplyTts) {
+                if (settings.listenOnly) "在 Operit 所选聊天中打字，整条回复写完后开始朗读；无需开麦。"
+                else "你说话，等待 AI 整条回复写完后播放声音。"
+            } else if (settings.listenOnly) "在 Operit 所选聊天中打字，回复生成时陆续朗读；无需开麦。" else "你说话，AI 用语音回复。",
+                color = ErpanColors.Muted, fontSize = 12.sp, lineHeight = 18.sp)
+        }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-            CallButton("开始通话", ErpanIcon.PHONE, enabled = !state.running && !busy, primary = true,
+            CallButton(if (settings.listenOnly) "开始听回复" else "开始通话", ErpanIcon.PHONE, enabled = !state.running && !busy, primary = true,
                 modifier = Modifier.weight(1.04f), onClick = onStart)
             CallButton("结束语音", ErpanIcon.END, enabled = state.running, primary = false,
                 modifier = Modifier.weight(0.96f), onClick = onEnd)
         }
+        if (state.running && state.listenOnly) TextButton(onClick = onInterrupt) { Text("停止播放当前及排队语音") }
         if (notice.isNotBlank()) Text(notice, color = ErpanColors.Rose, fontSize = 13.sp, lineHeight = 19.sp)
         if (state.running || state.message.contains("失败") || state.message.contains("占用"))
             Text(state.message, color = ErpanColors.Muted, fontSize = 12.sp, lineHeight = 18.sp)
+        if (state.pendingDraft != null) Surface(onClick = onReviewDraft, shape = RoundedCornerShape(14.dp),
+            color = ErpanColors.Blush, border = BorderStroke(0.8.dp, ErpanColors.Rose), modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(17.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                Text("语音待确认 · 尚未发送", fontSize = 17.sp, color = ErpanColors.Ink)
+                Text("点开悬浮待发栏改字或发送；挂断会取消。", fontSize = 13.sp, color = ErpanColors.Muted)
+            }
+        }
         Column(verticalArrangement = Arrangement.spacedBy(11.dp)) {
             SectionTitle("声音")
-            ErpanNavigationCard("当前音色", value = settings.displayVoice(), onClick = onVoice)
+            ErpanNavigationCard("当前声音", value = settings.displayVoice(),
+                subtitle = listOfNotNull(settings.currentVoiceProfile()?.name,
+                    if (state.running) "结束语音后可切换" else "点此选择语音方案").joinToString(" · "),
+                enabled = !state.running && !busy, onClick = onProfiles)
         }
+        ErpanNavigationCard("头像与光效", "动图 · 大小 · 裁剪 · 光效", onClick = onAvatar)
         ErpanNavigationCard("连接配置", "聊天 · 识别 · 合成", onClick = onConfig)
         val panel = remember { GenericShape { size, _ ->
             val cut = minOf(size.width * 0.06f, size.height * 0.1f)
@@ -90,17 +127,25 @@ import androidx.compose.ui.unit.sp
             Column(Modifier.padding(horizontal = 19.dp, vertical = 22.dp)) {
                 SectionTitle("通话设置", dark = true)
                 Spacer(Modifier.height(12.dp))
-                ErpanToggle("麦克风", state.micEnabled, enabled = state.running && !state.changing && !busy,
+                ErpanToggle("麦克风", state.micEnabled, enabled = !settings.listenOnly && state.running && !state.changing && !busy,
                     onChange = { onMic() })
                 HorizontalDivider(color = ErpanColors.CoalMuted.copy(alpha = 0.3f), thickness = 0.6.dp)
                 ErpanToggle("后台悬浮球", if (state.running) state.overlayVisible else settings.overlayEnabled,
-                    enabled = !busy, helper = "通话时显示耳畔悬浮球", onChange = onOverlay)
+                    enabled = !busy && !settings.listenOnly, helper = "语音通话时显示开关麦悬浮球", onChange = onOverlay)
                 HorizontalDivider(color = ErpanColors.CoalMuted.copy(alpha = 0.3f), thickness = 0.6.dp)
-                ErpanToggle("智能结束判断", settings.smartEndpoint, enabled = !state.running && !busy,
-                    helper = if (settings.smartEndpoint) "使用额外文本模型判断，可能增加等待和费用。" else "关闭时，约 0.55 秒静音提交",
+                ErpanToggle("悬浮字幕", if (state.running) state.captionsVisible else settings.captionsEnabled,
+                    enabled = !busy, helper = "显示正在生成的回复；可拖动、收起，文字可能比声音稍快。", onChange = onCaptions)
+                HorizontalDivider(color = ErpanColors.CoalMuted.copy(alpha = 0.3f), thickness = 0.6.dp)
+                ErpanToggle("发送前确认", settings.confirmBeforeSend, enabled = !settings.listenOnly && !state.running && !busy,
+            helper = "识别后在悬浮窗改字，点发送才提交；通话中不可切换。", onChange = onConfirmBeforeSend)
+                HorizontalDivider(color = ErpanColors.CoalMuted.copy(alpha = 0.3f), thickness = 0.6.dp)
+                ErpanToggle("智能结束判断", settings.smartEndpoint && !settings.confirmBeforeSend,
+                    enabled = !settings.listenOnly && !state.running && !busy && !settings.confirmBeforeSend,
+                    helper = if (settings.confirmBeforeSend) "手动确认期间暂停判断服务；关闭发送前确认后恢复原设置。"
+                        else if (settings.smartEndpoint) "使用额外文本模型判断，可能增加等待和费用。" else "关闭时，约 0.55 秒静音提交",
                     onChange = onSmart)
                 HorizontalDivider(color = ErpanColors.CoalMuted.copy(alpha = 0.3f), thickness = 0.6.dp)
-                ErpanToggle("人声打断", !settings.disableVoiceInterruption, enabled = !busy,
+                ErpanToggle("人声打断", !settings.disableVoiceInterruption, enabled = !settings.listenOnly && !busy,
                     helper = if (settings.disableVoiceInterruption) "关闭时，等 AI 回复和语音结束后再说。" else "开启时，直接开口即可打断 AI。",
                     onChange = onVoiceInterruption)
                 Spacer(Modifier.height(14.dp))

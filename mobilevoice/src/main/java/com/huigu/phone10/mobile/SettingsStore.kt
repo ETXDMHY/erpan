@@ -21,6 +21,12 @@ data class MobileSettings(
     val endJudge: EndJudgeConfig? = null,
     val voiceName: String? = null,
     val disableVoiceInterruption: Boolean = false,
+    val gameAudioCoexist: Boolean = true,
+    val voiceProfiles: List<VoiceProfile>? = null,
+    val activeVoiceProfileId: String? = null,
+    val captionsEnabled: Boolean = false,
+    val listenOnly: Boolean = false,
+    val confirmBeforeSend: Boolean = false,
 )
 
 /** User-owned credentials stay encrypted in this app's non-backup storage. */
@@ -36,6 +42,7 @@ class SettingsStore(context: Context) {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, bytes.copyOfRange(0, 12)))
             return gson.fromJson(cipher.doFinal(bytes.copyOfRange(12, bytes.size)).toString(Charsets.UTF_8), MobileSettings::class.java)
+                .withCurrentVoiceDefaults()
         } catch (_: Exception) {
             throw IllegalStateException("语音配置无法解密，请重新填写并保存。")
         }

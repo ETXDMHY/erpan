@@ -1,7 +1,8 @@
 package com.huigu.phone10.mobile
 
 /** Playback focus never owns capture, the conversation, or the overlay lifetime. */
-internal class VoiceAudioFocus(private val request: () -> Boolean, private val pause: (Boolean) -> Unit) {
+internal class VoiceAudioFocus(private val request: () -> Boolean, private val pause: (Boolean) -> Unit,
+                              private val coexist: Boolean = false) {
     private var closed = false
     private var held = false
     private var playing = false
@@ -12,12 +13,15 @@ internal class VoiceAudioFocus(private val request: () -> Boolean, private val p
         if (playing) return
         playing = true
         recoveryUsed = false
+        // User-selected mixing: capture/routing still belong to the call service,
+        // but media focus is left with the game instead of creating a focus fight.
+        if (coexist) { pause(false); return }
         if (!held) held = request()
         pause(!held)
     }
 
     @Synchronized fun lost() {
-        if (closed) return
+        if (closed || coexist) return
         held = false
         if (!playing) return
         pause(true)
@@ -30,7 +34,7 @@ internal class VoiceAudioFocus(private val request: () -> Boolean, private val p
     }
 
     @Synchronized fun gained() {
-        if (closed) return
+        if (closed || coexist) return
         held = true
         if (playing) pause(false)
     }

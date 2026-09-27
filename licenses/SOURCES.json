@@ -1,0 +1,32 @@
+[
+  {
+    "file": "Apache-2.0.txt",
+    "url": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+    "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "bytes": 11358
+  },
+  {
+    "file": "ONNX-Runtime-MIT.txt",
+    "url": "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.22.0/LICENSE",
+    "sha256": "2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c",
+    "bytes": 1073
+  },
+  {
+    "file": "ONNX-Runtime-ThirdPartyNotices.txt",
+    "url": "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.22.0/ThirdPartyNotices.txt",
+    "sha256": "e9e90971a8e75a9a8ac0c6412e29c1202d079998389915aa485f46c816c3b4cc",
+    "bytes": 326866
+  },
+  {
+    "file": "Silero-bundled-LICENSE.txt",
+    "source": "silero-2.0.10.aar!assets/LICENSE",
+    "sha256": "2e63e9a38b6e8fc0c7bc37ce174caca1862870856c6daf5697cfb785e925520b",
+    "bytes": 1075
+  },
+  {
+    "file": "android-vad-MIT.txt",
+    "url": "https://raw.githubusercontent.com/gkonovalov/android-vad/1b006d0aaf8fa269986a8c95a196055550c9b877/LICENSE.md",
+    "sha256": "6fb5de4404b01b932d029de914126e50fc45f3a09b1057e3f8058930a4752619",
+    "bytes": 1066
+  }
+]

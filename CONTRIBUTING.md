@@ -10,13 +10,15 @@
 | `MainActivity`、`VoiceService` | Android 界面与前台会话生命周期 |
 | `SpeechTranscript` | 识别原文与可选声音线索；边界解析及同消息呈现 |
 | `VoiceConversation` | 一轮语音的识别、提交、回复、合成及取消 |
-| `BailianSpeech`、`MiniMaxSpeech`、`CloudSpeech`、`CloudEndJudge` | 服务商协议和可选结束判断 |
+| `BailianSpeech`、`MiniMaxSpeech`、`MossSpeech`、`VolcengineSpeech`、`VolcengineRecognition`、`CloudSpeech`、`CloudEndJudge` | 服务商协议和可选结束判断 |
 | `PcmRecorder`、`PcmPlayer` | 手机收音、PCM 播放 |
 | `OperitBridge`、`OperitProvider` | 本机授权、请求与回复事件 |
-| `SettingsStore`、`SpeechConfig` | 加密配置及配置校验 |
+| `SettingsStore`、`SpeechConfig`、`VoiceProfiles` | 加密配置、语音方案和配置校验 |
+| `FloatingCaptions`、`CaptionBuffer`、`CaptionLayout` | 悬浮字幕窗口、文本和布局 |
+| `VoiceAudioFocus`、`VoiceAudioRoute` | 游戏声音共存及耳机路由 |
 | `Phone10AvatarStore`、`Phone10MicOverlay` 等 | 头像、悬浮球与手势 |
 
-`operit/phone10-mobile-voice.js` 是分发使用的广播插件。Java worker 辅助代码保留为实验代码和构建资产；本版插件不加载 worker，不能将其当作已验收路线。包名与部分内部类沿用 Phone10，以保留安装和设置兼容。
+`operit/phone10-mobile-voice.js` 是分发使用的广播插件。当前插件会加载 APK 内的原生 worker，将长回复移出广播入口；历史读取 helper 由 JS 内嵌，源码在 operit/native。Operit 1.12.2 已验证加载兼容，持续长任务仍需实机验证。包名与部分内部类沿用 Phone10，以保留安装和设置兼容。
 
 ## 修改与验证
 

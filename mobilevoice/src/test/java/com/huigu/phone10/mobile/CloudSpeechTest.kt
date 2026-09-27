@@ -11,6 +11,18 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 class CloudSpeechTest {
+    @Test fun recognitionConnectionCheckAcceptsValidEmptyTextButRejectsMalformedResponse() = runBlocking {
+        val silence = CloudSpeech(config(), client { request ->
+            assertTrue(request.url.encodedPath.endsWith("/audio/transcriptions"))
+            "{\"text\":\"\"}".toResponseBody("application/json".toMediaType())
+        })
+        silence.checkRecognitionConnection()
+        listOf("{}", "{\"text\":123}", "<html>error</html>").forEach { body ->
+            val invalid = CloudSpeech(config(), client { body.toResponseBody("application/json".toMediaType()) })
+            assertThrows(SpeechApiException::class.java) { runBlocking { invalid.checkRecognitionConnection() } }
+        }
+    }
+
     private fun config(url: String = "https://speech.invalid/v1") = SpeechConfig(url, "test-key", "stt", url, "test-key", "tts", "voice")
     private fun client(handler: (Request) -> ResponseBody) = OkHttpClient.Builder().addInterceptor { chain ->
         Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")

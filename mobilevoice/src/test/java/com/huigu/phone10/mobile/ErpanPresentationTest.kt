@@ -5,6 +5,10 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ErpanPresentationTest {
+    @Test fun mutedMicrophoneStillShowsReplyAndPlaybackProgress() {
+        assertEquals("正在播放", VoiceState(true, "正在播放 Operit 的回复…", false).homeStatus(true))
+        assertEquals("等待回复", VoiceState(true, "等待 Operit 回复…", false).homeStatus(true))
+    }
     @Test fun oldSettingsWithoutDisplayNameKeepVoiceIdAndCredentials() {
         val old = MobileSettings(SpeechConfig.bailianDefaults().copy(voice = "private-voice-id", ttsKey = "test-secret"), chatId = "old-chat")
         val restored = Gson().fromJson(Gson().toJson(old), MobileSettings::class.java)

@@ -16,13 +16,16 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.Channel
 
 /** Pure in-memory request/response protocol, separately tested on the JVM. */
-internal class OperitPending(val kind: String, chatId: String? = null, text: String? = null, targetId: String? = null) {
+internal class OperitPending(val kind: String, chatId: String? = null, text: String? = null, targetId: String? = null, after: Long? = null,
+                            paged: Boolean = false) {
     val id: String = UUID.randomUUID().toString()
     val nonce: String = UUID.randomUUID().toString()
     private var payload: String? = JsonObject().apply {
         addProperty("version", 1); addProperty("id", id); addProperty("nonce", nonce); addProperty("kind", kind)
         chatId?.let { addProperty("chatId", it) }; text?.let { addProperty("text", it) }
         targetId?.let { addProperty("targetId", it) }
+        after?.let { addProperty("after", it) }
+        if (paged) addProperty("paged", true)
     }.toString()
     val events = Channel<JsonObject>(128)
     @Volatile var cancelled = false
@@ -33,6 +36,7 @@ internal class OperitPending(val kind: String, chatId: String? = null, text: Str
     private var nextSeq = 0
     private var receivedChars = 0
     private var claimed = false
+    private var workerClaimed = false
 
     @Synchronized fun payload(): ByteArray = (payload ?: throw FileNotFoundException()).toByteArray(Charsets.UTF_8)
 
@@ -42,6 +46,14 @@ internal class OperitPending(val kind: String, chatId: String? = null, text: Str
             if (event["version"]?.asInt != 1 || event["id"]?.asString != id || event["nonce"]?.asString != nonce)
                 return fail("OPERIT_INVALID_EVENT")
             val type = event["type"]?.asString
+            // Claim before bootstrap, so repeated broadcasts cannot race another
+            // worker into the engine pool or deliver a competing bootstrap error.
+            // This internal handshake does not enter the ordered text stream.
+            if (type == "worker_claim") {
+                if (kind != "reply" || workerClaimed || claimed) return false
+                workerClaimed = true
+                return true
+            }
             // Native worker failure is terminal and authenticated by the same
             // request nonce; its independent thread cannot know the chunk seq.
             if (type == "worker_error") return fail("OPERIT_WORKER_FAILED")
@@ -49,7 +61,8 @@ internal class OperitPending(val kind: String, chatId: String? = null, text: Str
             // even after Operit loses its process-local journal. Preserve the owner.
             if (type == "accepted" && claimed) return false
             if (event["seq"]?.asInt != nextSeq) return fail("OPERIT_INVALID_EVENT")
-            if (type !in listOf("accepted", "chats", "chunk", "complete", "error")) return fail("OPERIT_INVALID_EVENT")
+            val observeFrame = kind in listOf("observe", "observe_stream") && type in listOf("message_start", "message_end", "snapshot")
+            if (!observeFrame && type !in listOf("accepted", "chats", "chunk", "complete", "error")) return fail("OPERIT_INVALID_EVENT")
             if (type == "chunk") {
                 val text = event["text"]?.asString ?: return fail("OPERIT_INVALID_EVENT")
                 receivedChars += text.length

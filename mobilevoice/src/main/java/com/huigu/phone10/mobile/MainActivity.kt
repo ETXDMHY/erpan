@@ -3,7 +3,7 @@ package com.huigu.phone10.mobile
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
+import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -26,8 +26,26 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import kotlinx.coroutines.*
+import java.io.IOException
 
 class MainActivity : ComponentActivity() {
+    private var permissionReviewEntry by mutableIntStateOf(0)
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        permissionReviewEntry++
+    }
+    override fun onStart() {
+        super.onStart()
+        VoiceDiagnostics.record("activity_foreground")
+    }
+
+    override fun onStop() {
+        VoiceDiagnostics.record("activity_background")
+        super.onStop()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.getInsetsController(window, window.decorView).apply {
@@ -43,6 +61,7 @@ class MainActivity : ComponentActivity() {
             notice = "配置读取失败，请重新填写并保存。"; MobileSettings(SpeechConfig.bailianDefaults())
         }) }
         var draft by remember { mutableStateOf(saved) }
+        var editingProfileId by remember { mutableStateOf(saved.currentVoiceProfile()?.id) }
         var page by rememberSaveable { mutableStateOf("home") }
         var aboutReturn by rememberSaveable { mutableStateOf("home") }
         var target by remember { mutableStateOf("") }
@@ -53,19 +72,50 @@ class MainActivity : ComponentActivity() {
         var chats by remember { mutableStateOf<List<OperitChat>?>(null) }
         var dialog by remember { mutableStateOf<Pair<String, String>?>(null) }
         var askSave by remember { mutableStateOf(false) }
-        var avatar by remember { mutableStateOf<Bitmap?>(null) }
+        var checking by remember { mutableStateOf(false) }
+        var checkJob by remember { mutableStateOf<Job?>(null) }
+        var showCheck by remember { mutableStateOf(false) }
+        var checkResult by remember { mutableStateOf("") }
+        var showProfiles by remember { mutableStateOf(false) }
+        var namingProfile by remember { mutableStateOf(false) }
+        var profileError by remember { mutableStateOf("") }
+        var localVoices by remember { mutableStateOf(emptyList<LocalVoice>()) }
+        var catalogBase by remember { mutableStateOf<SpeechConfig?>(null) }
+        var catalogFresh by remember { mutableStateOf(false) }
+        var floatingPermissionTarget by remember { mutableStateOf("ball") }
+        val avatarStore = remember { Phone10AvatarStore(this) }
+        val avatarLoader = remember { Phone10AvatarLoader(this) }
+        val appearanceStore = remember { AvatarAppearanceStore(this) }
+        var appearance by remember { mutableStateOf(appearanceStore.load()) }
+        var appearanceDraft by remember { mutableStateOf(appearance) }
+        var avatar by remember { mutableStateOf<Drawable?>(null) }
         val sttDrafts = remember { mutableMapOf<String, SpeechConfig>() }
         val ttsDrafts = remember { mutableMapOf<String, Pair<SpeechConfig, String?>>() }
-        LaunchedEffect(Unit) { avatar = withContext(Dispatchers.IO) { Phone10AvatarStore(this@MainActivity).load() } }
+        LaunchedEffect(Unit) {
+            try { avatar = withContext(Dispatchers.IO) { avatarLoader.load(avatarStore.source()) } }
+            catch (_: Exception) { notice = "头像无法显示，请在外观里重新选择图片。" }
+        }
 
         fun openConfig(section: String = "") {
             draft = saved; target = section; notice = ""; page = "config"
+            editingProfileId = saved.currentVoiceProfile()?.id
             sttDrafts.clear(); ttsDrafts.clear()
         }
+        fun openAppearance() {
+            appearanceDraft = appearance
+            notice = ""
+            page = "appearance"
+        }
+        fun refreshFloatingAvatar() {
+            if (VoiceService.state.value.running) startService(Intent(this@MainActivity, VoiceService::class.java)
+                .setAction(VoiceService.AVATAR))
+        }
         fun back() {
+            if (checking) checkJob?.cancel()
             when (page) {
                 "about" -> page = aboutReturn
                 "config" -> if (draft != saved) askSave = true else { page = "home"; notice = "" }
+                "appearance" -> { appearanceDraft = appearance; page = "home"; notice = "" }
             }
         }
         BackHandler(enabled = page != "home") { back() }
@@ -81,15 +131,85 @@ class MainActivity : ComponentActivity() {
                 finally { busy = false }
             }
         }
-        fun saveEditor() {
-            persist(draft) { askSave = false; page = "home"; notice = "配置已保存在本机。" }
+        fun openProfiles() {
+            if (busy || checking || state.running) return
+            profileError = ""; notice = ""; showProfiles = true
+        }
+        fun refreshLocalVoices() {
+            if (busy || VoiceService.state.value.running) return
+            val connection = saved.localVoiceConnection() ?: return
+            busy = true; catalogFresh = false; profileError = ""
+            scope.launch {
+                try {
+                    val entries = fetchLocalVoices(connection)
+                    localVoices = entries; catalogBase = connection; catalogFresh = true
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (error: Exception) {
+                    profileError = if (error is SpeechApiException) error.message.orEmpty()
+                        else "声音列表未更新，请检查电脑语音服务；已保存方案保持不变。"
+                } finally { busy = false }
+            }
+        }
+        fun useVoiceSelection(next: MobileSettings) {
+            if (busy || VoiceService.state.value.running) return
+            busy = true; profileError = ""
+            scope.launch {
+                try {
+                    if (next.speech.effectiveTtsProvider == SpeechConfig.QWEN_LOCAL) {
+                        val entries = fetchLocalVoices(next.speech)
+                        requireLocalVoice(entries, next.speech)
+                        localVoices = entries; catalogBase = next.speech; catalogFresh = true
+                    }
+                    check(!VoiceService.state.value.running) { "call-started" }
+                    withContext(Dispatchers.IO) { store.save(next) }
+                    saved = next; draft = next; showProfiles = false
+                    notice = "已保存并使用「${next.currentVoiceProfile()?.name ?: next.voiceName.orEmpty()}」，下次通话生效。"
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (error: Exception) {
+                    catalogFresh = false
+                    profileError = if (error is SpeechApiException) error.message.orEmpty()
+                        else "未切换声音，请结束通话并检查连接后再试；原方案保留。"
+                } finally { busy = false }
+            }
+        }
+        fun requestNewProfileName() {
+            askSave = false
+            try {
+                draft.speech.validate(includeRecognition = !draft.listenOnly)
+                profileError = ""; notice = ""; askSave = false; namingProfile = true
+            } catch (invalid: IllegalArgumentException) {
+                notice = invalid.message.orEmpty()
+            }
+        }
+        fun saveEditor(newName: String? = null) {
+            if (busy || state.running) return
+            askSave = false
+            val existing = saved.profiles().firstOrNull { it.id == editingProfileId }
+            if (newName == null && existing == null) { requestNewProfileName(); return }
+            try {
+                val next = draft.copy(voiceProfiles = saved.voiceProfiles).saveVoiceProfile(
+                    newName ?: requireNotNull(existing).name, if (newName == null) existing?.id else null)
+                persist(next) {
+                    draft = next; editingProfileId = next.activeVoiceProfileId
+                    namingProfile = false; askSave = false; profileError = ""; page = "home"
+                    notice = "已保存并使用「${next.currentVoiceProfile()?.name}」。"
+                }
+            } catch (invalid: IllegalArgumentException) {
+                profileError = invalid.message.orEmpty(); notice = profileError
+            }
         }
         fun start() {
             if (state.running || busy) return
             try {
+                if (!saved.listenOnly && saved.confirmBeforeSend &&
+                    !Settings.canDrawOverlays(this@MainActivity)) {
+                    notice = "发送前确认需要悬浮显示权限：请先打开悬浮字幕或悬浮球，按提示允许耳畔悬浮显示，再开始通话。"
+                    return
+                }
                 require(saved.chatId.isNotBlank()) { "请先选中聊天窗口。" }
-                saved.speech.validate()
-                if (saved.smartEndpoint) requireNotNull(saved.endJudge) { "请填写智能判断服务。" }.validate()
+                saved.speech.validate(includeRecognition = !saved.listenOnly)
+                if (!saved.listenOnly && saved.smartEndpoint && !saved.confirmBeforeSend)
+                    requireNotNull(saved.endJudge) { "请填写智能判断服务。" }.validate()
                 notice = ""
                 ContextCompat.startForegroundService(this@MainActivity, Intent(this@MainActivity, VoiceService::class.java))
             } catch (invalid: IllegalArgumentException) {
@@ -97,12 +217,18 @@ class MainActivity : ComponentActivity() {
             } catch (_: Exception) { notice = "开始通话失败，请检查麦克风权限和音频占用。" }
         }
         val permissions = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) start()
+            if (saved.listenOnly || ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) start()
             else notice = "需要麦克风权限才能开始通话。"
         }
         fun requestStart() {
-            if (saved.chatId.isBlank() || runCatching { saved.speech.validate() }.isFailure) {
-                openConfig(); notice = "请先选择聊天，并填写识别和合成信息。"; return
+            val issues = configurationIssues(saved)
+            if (issues.isNotEmpty()) {
+                openConfig(); notice = issues.joinToString("\n"); return
+            }
+            if (saved.listenOnly) {
+                if (Build.VERSION.SDK_INT >= 33) permissions.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
+                else start()
+                return
             }
             permissions.launch(if (Build.VERSION.SDK_INT >= 33)
                 arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
@@ -114,32 +240,135 @@ class MainActivity : ComponentActivity() {
                     .setAction(VoiceService.OVERLAY).putExtra("enabled", enabled))
             }
         }
+        fun captionsPreference(enabled: Boolean) {
+            persist(saved.copy(captionsEnabled = enabled)) {
+                if (VoiceService.state.value.running) startService(Intent(this@MainActivity, VoiceService::class.java)
+                    .setAction(VoiceService.CAPTIONS).putExtra("enabled", enabled))
+            }
+        }
         val overlayPermission = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-            if (Settings.canDrawOverlays(this)) overlayPreference(true)
-            else notice = "请在系统悬浮权限列表中找到「耳畔」并允许显示，再返回开启悬浮球。"
+            if (Settings.canDrawOverlays(this)) {
+                when (floatingPermissionTarget) {
+                    "captions" -> captionsPreference(true)
+                    "review" -> persist(saved.copy(confirmBeforeSend = true))
+                    "review_draft" -> if (!VoiceService.showPendingDraft())
+                        notice = "草稿已结束；下次识别后会在悬浮待发栏显示。"
+                    else -> overlayPreference(true)
+                }
+            } else notice = "请在系统悬浮权限列表中找到「耳畔」并允许显示，再返回开启悬浮功能。"
+        }
+        LaunchedEffect(permissionReviewEntry) {
+            if (intent?.getBooleanExtra(VoiceService.REVIEW_PERMISSION_REQUEST, false) == true) {
+                intent?.removeExtra(VoiceService.REVIEW_PERMISSION_REQUEST)
+                if (Settings.canDrawOverlays(this@MainActivity)) VoiceService.showPendingDraft()
+                else {
+                    floatingPermissionTarget = "review_draft"
+                    try { overlayPermission.launch(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:$packageName"))) }
+                    catch (_: Exception) { notice = "请在系统应用设置中允许耳畔悬浮显示。" }
+                }
+            }
+        }
+        fun floatingPreference(feature: String, enabled: Boolean) {
+            if (enabled && !Settings.canDrawOverlays(this@MainActivity)) {
+                floatingPermissionTarget = feature
+                try { overlayPermission.launch(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))) }
+                catch (_: Exception) { notice = "无法打开悬浮权限设置，请在系统应用设置中授权。" }
+            } else if (feature == "captions") captionsPreference(enabled) else overlayPreference(enabled)
         }
         val avatarPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
             if (uri != null) scope.launch {
                 try {
-                    avatar = withContext(Dispatchers.IO) { Phone10AvatarStore(this@MainActivity).import(uri) }
-                    if (VoiceService.state.value.running) startService(Intent(this@MainActivity, VoiceService::class.java)
-                        .setAction(VoiceService.AVATAR))
+                    withContext(Dispatchers.IO) { avatarStore.import(uri) }
+                    avatar = withContext(Dispatchers.IO) { avatarLoader.load(avatarStore.source()) }
+                    notice = ""
+                    refreshFloatingAvatar()
                 }
-                catch (_: Exception) { notice = "图片读取失败，请换一张图片。" }
+                catch (error: Exception) {
+                    notice = (error as? IOException)?.message ?: "图片读取失败，请换一张图片。"
+                }
             }
         }
         fun showAbout() { aboutReturn = page; page = "about" }
 
+        fun checkConnections() {
+            if (checking || listing || busy || VoiceService.state.value.running) return
+            val snapshot = draft
+            checking = true; showCheck = true; checkResult = "正在检查填写内容…"
+            checkJob = scope.launch {
+                var connection: OperitBridge? = null
+                try {
+                    val issues = configurationIssues(snapshot)
+                    if (issues.isNotEmpty()) {
+                        checkResult = issues.joinToString("\n\n")
+                        return@launch
+                    }
+                    val cloud = CloudSpeech(snapshot.speech)
+                    val o = OperitBridge(this@MainActivity).also { connection = it }
+                    val checker = ConnectionCheck({
+                        val choices = o.listChats()
+                        if (snapshot.listenOnly && choices.any { it.id == snapshot.chatId }) o.readReplies(snapshot.chatId, null)
+                        choices
+                    }, cloud::checkRecognitionConnection,
+                        cloud::checkSynthesisConnection, {
+                            snapshot.endJudge?.let { CloudEndJudge(it).isComplete("我已经说完了。") }
+                        })
+                    VoiceDiagnostics.record("connection_check_started")
+                    checkResult = checker.run(snapshot) { checkResult = it }
+                } catch (cancelled: CancellationException) {
+                    checkResult = "检查已取消。"; throw cancelled
+                } catch (_: Exception) { checkResult = "检查未完成，请稍后重试。" }
+                finally {
+                    connection?.close()
+                    checking = false; checkJob = null
+                    VoiceDiagnostics.record("connection_check_finished")
+                }
+            }
+        }
+
         when (page) {
-            "config" -> ErpanConfig(draft, enabled = !state.running && !busy, listing = listing, notice = notice, target = target,
+            "appearance" -> ErpanAppearance(appearanceDraft, avatar, notice, busy,
+                onChange = { appearanceDraft = it.safe() },
+                onPick = { avatarPicker.launch("image/*") },
+                onReset = {
+                    if (!busy) scope.launch {
+                        busy = true
+                        try {
+                            withContext(Dispatchers.IO) {
+                                avatarStore.restoreDefault()
+                                appearanceStore.save(AvatarAppearance())
+                            }
+                            avatar = null
+                            appearance = AvatarAppearance()
+                            appearanceDraft = appearance
+                            notice = "已恢复默认头像与外观。"
+                            refreshFloatingAvatar()
+                        } catch (_: Exception) { notice = "恢复默认失败，请检查手机存储。" }
+                        finally { busy = false }
+                    }
+                },
+                onSave = {
+                    if (!busy) scope.launch {
+                        busy = true
+                        try {
+                            val next = appearanceDraft.safe()
+                            withContext(Dispatchers.IO) { appearanceStore.save(next) }
+                            appearance = next
+                            notice = ""
+                            page = "home"
+                            refreshFloatingAvatar()
+                        } catch (_: Exception) { notice = "外观保存失败，请检查手机存储。" }
+                        finally { busy = false }
+                    }
+                },
+                onBack = { back() })
+            "config" -> ErpanConfig(draft, enabled = !state.running && !busy && !checking, listing = listing, notice = notice, target = target,
                 onChange = { draft = it }, onStt = { provider ->
                     val current = draft.speech
                     val currentProvider = current.provider ?: SpeechConfig.OPENAI
                     if (provider != currentProvider) {
                         sttDrafts[currentProvider] = current
-                        val next = sttDrafts[provider] ?: if (provider == SpeechConfig.BAILIAN) SpeechConfig.bailianDefaults() else SpeechConfig.openAiDefaults()
-                        draft = draft.copy(speech = current.copy(provider = provider, sttBaseUrl = next.sttBaseUrl,
-                            sttKey = next.sttKey, sttModel = next.sttModel, ttsProvider = current.effectiveTtsProvider))
+                        draft = draft.copy(speech = current.withSttProvider(provider, sttDrafts[provider]))
                     }
                 }, onTts = { provider ->
                     val current = draft.speech
@@ -148,7 +377,10 @@ class MainActivity : ComponentActivity() {
                         val old = ttsDrafts[provider]
                         val next = current.withTtsProvider(provider)
                         draft = draft.copy(speech = if (old == null) next else next.copy(ttsBaseUrl = old.first.ttsBaseUrl,
-                            ttsKey = old.first.ttsKey, ttsModel = old.first.ttsModel, voice = old.first.voice), voiceName = old?.second)
+                            ttsKey = old.first.ttsKey, ttsModel = old.first.ttsModel, voice = old.first.voice,
+                            volcResource = old.first.volcResource, volcAppId = old.first.volcAppId,
+                            voicePrompt = old.first.voicePrompt, mossSpeed = old.first.mossSpeed,
+                            mossTextMode = old.first.mossTextMode), voiceName = old?.second)
                     }
                 }, onChats = {
                     if (!listing) {
@@ -160,7 +392,10 @@ class MainActivity : ComponentActivity() {
                             finally { o.close(); listing = false }
                         }
                     }
-                }, onSave = { saveEditor() }, onBack = { back() }, onAbout = { showAbout() })
+                }, onSave = { saveEditor() }, onBack = { back() }, onAbout = { showAbout() },
+                checking = checking, onCheck = { checkConnections() },
+                profileName = saved.profiles().firstOrNull { it.id == editingProfileId }?.name,
+                onSaveAs = { requestNewProfileName() })
             "about" -> ErpanAbout(onBack = { back() }, onDetails = { kind ->
                 val file = if (kind == "许可说明") "erpan-notices.txt" else "erpan-guide.md"
                 scope.launch {
@@ -169,30 +404,72 @@ class MainActivity : ComponentActivity() {
                     dialog = kind to text
                 }
             })
-            else -> ErpanHome(saved, state, avatar, busy, notice,
-                onStart = { requestStart() }, onEnd = { stopService(Intent(this@MainActivity, VoiceService::class.java)) },
+            else -> ErpanHome(saved, state, avatar, appearance, busy, notice,
+                onStart = { requestStart() }, onEnd = {
+                    state.pendingDraft?.let { VoiceService.cancelPendingDraft(it.id) }
+                    stopService(Intent(this@MainActivity, VoiceService::class.java))
+                },
                 onMic = { if (state.running && !state.changing) startService(Intent(this@MainActivity, VoiceService::class.java).setAction(VoiceService.TOGGLE)) },
-                onOverlay = { enabled ->
-                    if (enabled && !Settings.canDrawOverlays(this@MainActivity)) {
-                        try { overlayPermission.launch(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))) }
-                        catch (_: Exception) { notice = "无法打开悬浮权限设置，请在系统应用设置中授权。" }
-                    } else overlayPreference(enabled)
-                }, onSmart = { enabled ->
+                onOverlay = { enabled -> floatingPreference("ball", enabled) }, onSmart = { enabled ->
                     if (enabled && runCatching { requireNotNull(saved.endJudge).validate() }.isFailure) {
                         openConfig("judge"); draft = draft.copy(smartEndpoint = true, endJudge = draft.endJudge ?: EndJudgeConfig())
                         notice = "请填写判断服务；它会额外调用文本模型并计费。"
                     } else persist(saved.copy(smartEndpoint = enabled))
+                }, onConfirmBeforeSend = { enabled ->
+                    if (!state.running) {
+                        if (enabled && !Settings.canDrawOverlays(this@MainActivity)) {
+                            floatingPermissionTarget = "review"
+                            try { overlayPermission.launch(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:$packageName"))) }
+                            catch (_: Exception) { notice = "请在系统应用设置中允许耳畔悬浮显示。" }
+                        } else persist(saved.copy(confirmBeforeSend = enabled))
+                    }
                 }, onVoiceInterruption = { enabled ->
                     persist(saved.copy(disableVoiceInterruption = !enabled)) {
                         if (VoiceService.state.value.running) startService(Intent(this@MainActivity, VoiceService::class.java)
                             .setAction(VoiceService.VOICE_INTERRUPTION).putExtra("enabled", enabled))
                     }
-                }, onAvatar = { avatarPicker.launch("image/*") }, onConfig = { openConfig() }, onVoice = { openConfig("voice") },
-                onLogs = { dialog = "最近语音状态" to VoiceDiagnostics.snapshot().ifBlank { "暂无记录" } }, onAbout = { showAbout() })
+                }, onReviewDraft = {
+                    if (!Settings.canDrawOverlays(this@MainActivity)) {
+                        floatingPermissionTarget = "review_draft"
+                        try { overlayPermission.launch(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:$packageName"))) }
+                        catch (_: Exception) { notice = "请在系统应用设置中允许耳畔悬浮显示。" }
+                    } else if (!VoiceService.showPendingDraft())
+                        notice = "草稿已结束；下次识别后会在悬浮待发栏显示。"
+                }, onAvatar = { openAppearance() }, onConfig = { openConfig() },
+                onLogs = { dialog = "最近语音状态" to VoiceDiagnostics.snapshot().ifBlank { "暂无记录" } }, onAbout = { showAbout() },
+                onProfiles = { openProfiles() }, onCaptions = { enabled -> floatingPreference("captions", enabled) },
+                onListenOnly = { enabled -> if (!state.running) persist(saved.copy(listenOnly = enabled)) },
+                onInterrupt = { startService(Intent(this@MainActivity, VoiceService::class.java).setAction(VoiceService.INTERRUPT)) })
         }
+        if (showProfiles) VoiceProfilesDialog(saved, busy || state.running, profileError.ifBlank { notice },
+            onUse = { id ->
+                if (!busy && !state.running) {
+                    useVoiceSelection(saved.selectVoiceProfile(id))
+                }
+            }, onRemove = { id ->
+                if (!busy && !state.running) {
+                    val next = saved.removeVoiceProfile(id)
+                    persist(next) { draft = draft.copy(voiceProfiles = next.voiceProfiles); profileError = ""; notice = "方案已移除。" }
+                }
+            }, onCreate = { showProfiles = false; openConfig(); editingProfileId = null }, onClose = { showProfiles = false },
+            localVoices = localVoices, catalogFresh = catalogFresh, onRefresh = { refreshLocalVoices() },
+            onLocalVoice = { voice ->
+                try { catalogBase?.let { useVoiceSelection(saved.addLocalVoice(it, voice)) } }
+                catch (error: Exception) { profileError = error.message ?: "无法保存这个声音。" }
+            })
+        if (namingProfile) VoiceProfileNameDialog("", busy || state.running,
+            profileError.ifBlank { notice }, onSave = { name -> saveEditor(name) }, onClose = { namingProfile = false })
+        if (showCheck) AlertDialog(onDismissRequest = { checkJob?.cancel(); showCheck = false },
+            title = { Text(if (checking) "正在检查连接" else "连接检查结果") },
+            text = { Text(checkResult, Modifier.heightIn(max = 480.dp).verticalScroll(rememberScrollState()), fontSize = 14.sp) },
+            confirmButton = { TextButton(onClick = { checkJob?.cancel(); showCheck = false }) {
+                Text(if (checking) "取消检查" else "关闭")
+            } })
         if (askSave) AlertDialog(onDismissRequest = { askSave = false }, title = { Text("保存这次修改？") },
             text = { Text("配置有尚未保存的内容。") },
-            confirmButton = { TextButton(enabled = !busy, onClick = { saveEditor() }) { Text("保存并返回") } },
+            confirmButton = { TextButton(enabled = !busy, onClick = { saveEditor() }) { Text("保存并使用") } },
             dismissButton = { TextButton(enabled = !busy, onClick = { draft = saved; askSave = false; page = "home"; notice = "" }) { Text("放弃修改") } })
         dialog?.let { (title, text) -> AlertDialog(onDismissRequest = { dialog = null }, title = { Text(title) },
             text = { Text(text, Modifier.heightIn(max = 480.dp).verticalScroll(rememberScrollState()), fontSize = 13.sp) },

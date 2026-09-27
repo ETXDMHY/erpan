@@ -9,6 +9,9 @@ class SpeechTranscript(
     private val spans: List<Pair<Long, Long>> = emptyList(),
     private val emotions: Map<String, Double> = emptyMap(),
 ) {
+    /** Provider timing applies only to the recognized words, never to a changed message. */
+    fun withText(edited: String): SpeechTranscript =
+        if (edited.trim() == text.trim()) this else SpeechTranscript(edited.trim())
     fun forChat(includeVoiceHints: Boolean = ENABLE_VOICE_HINTS): String {
         val spoken = text.trim()
         if (!includeVoiceHints || spoken.isEmpty()) return spoken
